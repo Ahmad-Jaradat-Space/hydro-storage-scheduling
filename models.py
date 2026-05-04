@@ -89,8 +89,20 @@ class Reservoir:
 # SDP on a discretised reservoir state, Markov price state
 # ===================================================================
 def solve_sdp(reservoir, P_trans, price_centres, T, n_V=51, n_a=21,
-              mean_inflow_per_t=None, terminal_reward=0.0):
-    """Backward-induction value iteration.
+              mean_inflow_per_t=None, terminal_reward=0.0,
+              water_value=None):
+    """Backward-induction value iteration with linear V-grid interpolation
+    in the continuation lookup.
+
+    Args:
+        terminal_reward : scalar OR shape-(n_V, n_p) terminal value.
+        water_value     : if not None, terminal_reward is replaced with
+                          `water_value * V_grid[:, None]` broadcast over
+                          price bins. Models the future value of water
+                          carried over the horizon — without this, the
+                          SDP has no incentive to leave any water in
+                          storage at t=T and dispatches it all by the
+                          last few steps.
 
     Returns:
         V_grid       : reservoir level grid, shape (n_V,)
@@ -106,7 +118,10 @@ def solve_sdp(reservoir, P_trans, price_centres, T, n_V=51, n_a=21,
         mean_inflow_per_t = np.full(T, reservoir.mean_inflow_mwh)
 
     value = np.zeros((T + 1, n_V, n_p))
-    value[-1] = terminal_reward
+    if water_value is not None:
+        value[-1] = float(water_value) * V_grid[:, None] * np.ones((1, n_p))
+    else:
+        value[-1] = terminal_reward
 
     policy = np.zeros((T, n_V, n_p), dtype=np.int8)
 
@@ -114,22 +129,32 @@ def solve_sdp(reservoir, P_trans, price_centres, T, n_V=51, n_a=21,
     # of water in storage. Actions that exceed (2 * V) are infeasible.
     feasible = (a_grid[None, :] <= 2 * V_grid[:, None])      # (n_V, n_a)
 
+    dV = V_grid[1] - V_grid[0] if n_V > 1 else 1.0
+
     for t in range(T - 1, -1, -1):
         inflow = mean_inflow_per_t[t]
         V_after = V_grid[:, None] + inflow - 0.5 * a_grid[None, :]
         V_next = np.clip(V_after, 0.0, reservoir.V_max)
-        V_next_idx = np.clip(
-            np.round(V_next / reservoir.V_max * (n_V - 1)).astype(int), 0, n_V - 1
-        )
 
-        cont = (P_trans @ value[t + 1].T).T               # (n_V, n_p)
-        cont_lookup = cont[V_next_idx]                    # (n_V, n_a, n_p)
+        # --- Linear interpolation over V_grid in the continuation lookup ---
+        # cont has shape (n_V, n_p); we need to look it up at V_next which
+        # may sit between two grid points. Floor / ceil indices + weight.
+        pos = V_next / dV                                  # (n_V, n_a)
+        i_lo = np.clip(np.floor(pos).astype(int), 0, n_V - 1)
+        i_hi = np.clip(i_lo + 1, 0, n_V - 1)
+        w_hi = np.clip(pos - i_lo, 0.0, 1.0)               # weight on i_hi
+        # In-range cells where i_lo == i_hi (boundary) get w_hi=0 cleanly.
+
+        cont = (P_trans @ value[t + 1].T).T                # (n_V, n_p)
+        # Gather rows: shape (n_V, n_a, n_p)
+        cont_lo = cont[i_lo]
+        cont_hi = cont[i_hi]
+        cont_lookup = (1.0 - w_hi[..., None]) * cont_lo + w_hi[..., None] * cont_hi
 
         reward = price_centres[:, None] * 0.5 * a_grid[None, :]   # (n_p, n_a)
 
         # Q[V, p, a] = reward[p, a] + cont_lookup[V, a, p]
         Q = reward[None, :, :] + cont_lookup.transpose(0, 2, 1)   # (n_V, n_p, n_a)
-        # mask infeasible actions
         Q = np.where(feasible[:, None, :], Q, -np.inf)
         best = Q.argmax(axis=2)
         value[t] = np.take_along_axis(Q, best[..., None], axis=2)[..., 0]
@@ -139,9 +164,17 @@ def solve_sdp(reservoir, P_trans, price_centres, T, n_V=51, n_a=21,
 
 
 def simulate_policy_sdp(reservoir, policy, V_grid, a_grid, P_edges,
-                        price_path, inflow_path):
+                        price_path, inflow_path,
+                        no_negative_dispatch=True):
     """Roll the SDP policy forward on a single realised price path.
-    Returns (V_history, a_history, revenue_per_t)."""
+
+    `no_negative_dispatch` operator override is exposed as a flag so the
+    SDP, greedy, and LP can all be set consistently — the previous
+    implementation hard-coded it for the SDP but not for the LP, which
+    biased the comparison.
+
+    Returns (V_history, a_history, revenue_per_t).
+    """
     T = len(price_path)
     V = reservoir.initial_V
     n_V = len(V_grid); n_a = len(a_grid)
@@ -157,8 +190,8 @@ def simulate_policy_sdp(reservoir, policy, V_grid, a_grid, P_edges,
         a_idx = int(policy[t, v_idx, p_idx])
         a = a_grid[a_idx]
         a = min(a, max(0.0, V / 0.5))         # physical-feasibility cap
-        if price_path[t] < 0:                  # operator override: no
-            a = 0.0                            #   dispatch at negative prices
+        if no_negative_dispatch and price_path[t] < 0:
+            a = 0.0
         rev[t] = price_path[t] * 0.5 * a
         V, _ = reservoir.step(V, a, inflow_path[t])
         Vh[t + 1] = V; ah[t] = a
@@ -168,8 +201,13 @@ def simulate_policy_sdp(reservoir, policy, V_grid, a_grid, P_edges,
 # ===================================================================
 # Heuristic policies
 # ===================================================================
-def greedy_threshold(reservoir, price_path, inflow_path, threshold):
-    """Dispatch maximally if price > threshold and reservoir non-empty."""
+def greedy_threshold(reservoir, price_path, inflow_path, threshold,
+                     no_negative_dispatch=True):
+    """Dispatch maximally if price > threshold and reservoir non-empty.
+
+    `no_negative_dispatch` is moot here because threshold>=0 already gates
+    out negatives, but exposed for symmetry with the SDP/LP.
+    """
     T = len(price_path); V = reservoir.initial_V
     Vh = np.empty(T + 1); Vh[0] = V
     ah = np.empty(T); rev = np.empty(T)
@@ -178,43 +216,85 @@ def greedy_threshold(reservoir, price_path, inflow_path, threshold):
             a = min(reservoir.a_max, V / 0.5)
         else:
             a = 0.0
+        if no_negative_dispatch and price_path[t] < 0:
+            a = 0.0
         rev[t] = price_path[t] * 0.5 * a
         V, _ = reservoir.step(V, a, inflow_path[t])
         Vh[t + 1] = V; ah[t] = a
     return Vh, ah, rev
 
 
-def perfect_foresight_lp(reservoir, price_path, inflow_path):
+def perfect_foresight_lp(reservoir, price_path, inflow_path,
+                         tight_storage=True, no_negative_dispatch=True):
     """Upper bound — solves the LP with full knowledge of price and inflow.
+
     Decision: dispatch d_t in [0, a_max].
-    State: V_{t+1} = V_t + i_t - 0.5*d_t,   0 <= V_t <= V_max.
-    Maximise sum p_t * 0.5 * d_t.
+    State: V_{t+1} = V_t + i_t - 0.5*d_t - spill_t,   0 <= V_t <= V_max,
+    spill_t >= 0.
+
+    `tight_storage=True` (default) enforces the actual reservoir cap by
+    introducing free spill_t >= 0 alongside dispatch. The previous
+    formulation relaxed the upper-bound constraint and let inflows
+    accumulate without limit; with this flag the upper bound is the
+    *true* perfect-foresight bound under the physics, not a relaxation.
+
+    `no_negative_dispatch=True` enforces d_t = 0 when p_t < 0, matching
+    the operator override applied to the SDP and DRL — without this, the
+    LP can earn negative revenue in negative-price half-hours, biasing
+    the comparison.
     """
     from scipy.optimize import linprog
     T = len(price_path)
-    # decision vector x = [d_0 .. d_{T-1}]   shape (T,)
-    # objective: minimise -sum p_t * 0.5 * d_t
-    c = -0.5 * np.asarray(price_path)
+    p = np.asarray(price_path)
 
-    # bounds 0 <= d_t <= a_max
-    bounds = [(0.0, reservoir.a_max)] * T
+    if not tight_storage:
+        # Original relaxation: implicit spill, no V <= V_max constraint.
+        c = -0.5 * p
+        if no_negative_dispatch:
+            bounds = [(0.0, 0.0) if p[t] < 0 else (0.0, reservoir.a_max)
+                      for t in range(T)]
+        else:
+            bounds = [(0.0, reservoir.a_max)] * T
+        A_ub = np.tril(np.ones((T, T))) * 0.5
+        b_ub = reservoir.initial_V + np.cumsum(inflow_path)
+        sol = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        if not sol.success:
+            raise RuntimeError(f"LP failed: {sol.message}")
+        d = sol.x
+    else:
+        # Tight version: variables are [d_0..d_{T-1}, s_0..s_{T-1}] where
+        # s_t is spill at period t (>= 0). Constraints encode
+        #     V_t = V_0 + sum_{u<t}(i_u - 0.5*d_u - s_u)
+        #     0 <= V_t <= V_max  for t = 1..T
+        # equivalently
+        #     0.5*sum_{u<t} d_u + sum_{u<t} s_u <= V_0 + sum_{u<t} i_u   (V_t >= 0)
+        #     -0.5*sum_{u<t} d_u - sum_{u<t} s_u <= V_max - V_0 - sum_{u<t} i_u  (V_t <= V_max)
+        c = np.concatenate([-0.5 * p, np.zeros(T)])
+        if no_negative_dispatch:
+            d_bounds = [(0.0, 0.0) if p[t] < 0 else (0.0, reservoir.a_max)
+                        for t in range(T)]
+        else:
+            d_bounds = [(0.0, reservoir.a_max)] * T
+        s_bounds = [(0.0, None)] * T
+        bounds = d_bounds + s_bounds
 
-    # State physics: V_{t+1} = V_t + i_t - 0.5*d_t - spill_t, with V_t in
-    # [0, V_max] and spill_t >= 0. We model spill implicitly: drop the
-    # V <= V_max constraint (excess water just spills, free of charge),
-    # and keep V >= 0. This avoids the LP being forced to dispatch into
-    # negative-price periods just because inflow + initial_V exceeds V_max.
-    A_ub_lo = np.tril(np.ones((T, T))) * 0.5            # 0.5*sum(d_s) <= V_0 + sum(i_s)
-    cum_inflow = np.cumsum(inflow_path)
-    b_ub_lo = reservoir.initial_V + cum_inflow
+        L = np.tril(np.ones((T, T)))            # cumulative-sum operator
+        cum_inflow = np.cumsum(inflow_path)
 
-    A_ub = A_ub_lo
-    b_ub = b_ub_lo
+        # V_t >= 0  =>   0.5 * L @ d + L @ s <= V_0 + cum_inflow
+        A1 = np.hstack([0.5 * L, L])
+        b1 = reservoir.initial_V + cum_inflow
+        # V_t <= V_max  =>  -0.5 * L @ d - L @ s <= V_max - V_0 - cum_inflow
+        A2 = np.hstack([-0.5 * L, -L])
+        b2 = reservoir.V_max - reservoir.initial_V - cum_inflow
 
-    sol = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
-    if not sol.success:
-        raise RuntimeError(f"LP failed: {sol.message}")
-    d = sol.x
+        A_ub = np.vstack([A1, A2])
+        b_ub = np.concatenate([b1, b2])
+
+        sol = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        if not sol.success:
+            raise RuntimeError(f"LP failed: {sol.message}")
+        d = sol.x[:T]
 
     # roll forward to get the realised V trajectory
     V = reservoir.initial_V
@@ -236,3 +316,18 @@ def cvar(rewards, alpha=0.05):
     cutoff = np.quantile(rewards, alpha)
     tail = rewards[rewards <= cutoff]
     return float(tail.mean()) if len(tail) > 0 else float(cutoff)
+
+
+def bootstrap_metric_ci(values, fn, n_boot=500, alpha=0.05, seed=0):
+    """Bootstrap 95% CI for a scalar statistic over an array of per-path
+    totals. Returns (point, lo, hi)."""
+    rng = np.random.default_rng(seed)
+    n = len(values)
+    point = float(fn(values))
+    boots = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        boots[b] = fn(values[idx])
+    lo = float(np.quantile(boots, alpha / 2))
+    hi = float(np.quantile(boots, 1 - alpha / 2))
+    return point, lo, hi

@@ -33,12 +33,16 @@ def model(r):
     h0 = omega / jnp.maximum(1 - alpha - beta, 1e-3)
 
     def step(state, t):
-        r_prev, h_prev = state
-        eps_prev = r_prev - mu - phi * r_prev   # crude — sufficient for the prior step
+        r_prev, r_prev2, h_prev = state
+        # Correct ARMA(1,0)-GARCH(1,1) innovation:
+        # eps_{t-1} = r_{t-1} - mu - phi * r_{t-2}
+        eps_prev = r_prev - mu - phi * r_prev2
         h_t = omega + alpha * eps_prev ** 2 + beta * h_prev
-        return (r[t], h_t), h_t
+        return (r[t], r_prev, h_t), h_t
 
-    init = (r[0], h0)
+    # carry both the most-recent return and the one before so eps_{t-1}
+    # uses the correct r_{t-2} term, not r_{t-1} as a placeholder.
+    init = (r[0], jnp.float32(0.0), h0)
     _, h_seq = jax.lax.scan(step, init, jnp.arange(1, T))
     h = jnp.concatenate([jnp.array([h0]), h_seq])
 
@@ -76,17 +80,21 @@ def simulate_paths(samples, last_price, last_return, n_paths, horizon,
     # initial unconditional variance
     h_prev = omega / np.maximum(1 - alpha - beta, 1e-3)
     r_prev = np.full(n_paths, float(last_return), dtype=np.float64)
+    # r_{t-2} starts at the unconditional mean (0 in log-returns space)
+    r_prev2 = np.zeros(n_paths, dtype=np.float64)
 
     log_p = np.full(n_paths, float(np.log(last_price + shift)), dtype=np.float64)
     out = np.empty((n_paths, horizon), dtype=np.float64)
     for t in range(horizon):
-        eps_prev = r_prev - mu - phi * r_prev   # mirrors the model
+        # mirrors the corrected model: eps_{t-1} = r_{t-1} - mu - phi * r_{t-2}
+        eps_prev = r_prev - mu - phi * r_prev2
         h = omega + alpha * eps_prev ** 2 + beta * h_prev
         h = np.clip(h, 1e-8, 100.0)
         z = rng.standard_normal(n_paths)
         r_t = mu + phi * r_prev + np.sqrt(h) * z
         log_p = log_p + r_t
         out[:, t] = np.exp(log_p) - shift
+        r_prev2 = r_prev
         r_prev = r_t
         h_prev = h
     # AEMO market price floor / ceiling. The Bayesian GARCH on log-returns

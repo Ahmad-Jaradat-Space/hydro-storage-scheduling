@@ -43,7 +43,7 @@ def cvar_inner(values, probs, alpha):
 
 def solve_cvar_sdp(reservoir, P_trans, price_centres, T, alpha=0.10,
                    n_V=51, n_a=21, mean_inflow_per_t=None,
-                   terminal_reward=0.0):
+                   terminal_reward=0.0, water_value=None):
     """Backward induction with CVaR continuation.
 
     `alpha` is the CVaR level — smaller alpha is more risk-averse.
@@ -58,22 +58,27 @@ def solve_cvar_sdp(reservoir, P_trans, price_centres, T, alpha=0.10,
         mean_inflow_per_t = np.full(T, reservoir.mean_inflow_mwh)
 
     value = np.zeros((T + 1, n_V, n_p))
-    value[-1] = terminal_reward
+    if water_value is not None:
+        value[-1] = float(water_value) * V_grid[:, None] * np.ones((1, n_p))
+    else:
+        value[-1] = terminal_reward
     policy = np.zeros((T, n_V, n_p), dtype=np.int8)
 
     # same action-feasibility mask as in solve_sdp
     feasible_V_a = (a_grid[None, :] <= 2 * V_grid[:, None])    # (n_V, n_a)
+    dV = V_grid[1] - V_grid[0] if n_V > 1 else 1.0
 
     for t in range(T - 1, -1, -1):
         inflow = mean_inflow_per_t[t]
         V_after = V_grid[:, None] + inflow - 0.5 * a_grid[None, :]
         V_next = np.clip(V_after, 0.0, reservoir.V_max)
-        V_next_idx = np.clip(
-            np.round(V_next / reservoir.V_max * (n_V - 1)).astype(int), 0, n_V - 1
-        )
-        # value[t+1] shape (n_V, n_p)
-        # cont_lookup[V_idx, a_idx, p_idx_next] = value[t+1, V_next_idx[V_idx, a_idx], p_idx_next]
-        cont_lookup = value[t + 1][V_next_idx]  # (n_V, n_a, n_p)
+        # Linear V-grid interpolation in the continuation lookup
+        pos = V_next / dV
+        i_lo = np.clip(np.floor(pos).astype(int), 0, n_V - 1)
+        i_hi = np.clip(i_lo + 1, 0, n_V - 1)
+        w_hi = np.clip(pos - i_lo, 0.0, 1.0)
+        cont_lookup = ((1.0 - w_hi[..., None]) * value[t + 1][i_lo]
+                       + w_hi[..., None] * value[t + 1][i_hi])  # (n_V, n_a, n_p)
 
         reward = price_centres[:, None] * 0.5 * a_grid[None, :]   # (n_p, n_a)
 

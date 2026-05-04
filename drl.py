@@ -25,8 +25,17 @@ class HydroEnv:
         self.scenarios = scenarios.astype(np.float32)
         self.horizon = horizon
         self.rng = np.random.default_rng(rng_seed)
-        self.price_max = float(np.percentile(scenarios, 99) + 1e-6)
+        # Use the 99.9th percentile + a log transform for normalisation so
+        # the agent actually sees the heavy right tail. The previous
+        # 99th-percentile + linear normalisation clipped the agent's view
+        # of the spike events the storage policy exists to capture.
+        self.price_norm_ref = float(np.percentile(scenarios, 99.9) + 1.0)
         self.reset()
+
+    def _norm_price(self, price):
+        # Symmetric log: positive prices saturate slowly, negatives go negative.
+        return float(np.sign(price) * np.log1p(np.abs(price)) /
+                     np.log1p(self.price_norm_ref))
 
     def reset(self):
         self.t = 0
@@ -39,7 +48,7 @@ class HydroEnv:
         price = self.scenarios[self.path_idx, self.t]
         return np.array([
             self.V / self.reservoir.V_max,
-            price / self.price_max,
+            self._norm_price(price),
             self.t / self.horizon,
         ], dtype=np.float32)
 
