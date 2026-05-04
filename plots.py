@@ -84,6 +84,98 @@ def scenarios_fan(scenarios, real=None, ax=None, n_show=200):
     return ax
 
 
+def scalogram(coeffs, periods_hours, ax=None):
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(13, 4))
+    power = np.log10(np.abs(coeffs) ** 2 + 1e-9)
+    extent = [0, coeffs.shape[1], periods_hours[0], periods_hours[-1]]
+    im = ax.imshow(power, aspect="auto", origin="lower",
+                   cmap="magma", extent=extent)
+    ax.set_yscale("log")
+    ax.set_yticks([0.5, 1, 6, 12, 24, 24 * 7])
+    ax.get_yaxis().set_major_formatter(
+        plt.matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g} h")
+    )
+    ax.set_ylabel("period"); ax.set_xlabel("time index (30-min)")
+    plt.colorbar(im, ax=ax, label="log10 power")
+    return ax
+
+
+def posterior_pair(samples, names, ax=None):
+    """Trace + density mini-grid for the named parameters."""
+    import matplotlib.pyplot as plt
+    n = len(names)
+    if ax is None:
+        fig, ax = plt.subplots(n, 2, figsize=(11, 1.8 * n))
+    for i, name in enumerate(names):
+        s = np.asarray(samples[name])
+        ax[i, 0].plot(s, color=ACCENT, lw=0.6)
+        ax[i, 0].set_ylabel(name)
+        ax[i, 1].hist(s, bins=40, color=ACCENT, alpha=0.85)
+        ax[i, 1].set_yticks([])
+        ax[i, 1].axvline(np.median(s), color=WARN, lw=1.0)
+    ax[0, 0].set_title("trace")
+    ax[0, 1].set_title("posterior density")
+    ax[-1, 0].set_xlabel("MCMC iteration")
+    ax[-1, 1].set_xlabel("value")
+    return ax
+
+
+def regime_ribbon(prices, regime_prob_high, ax=None):
+    """Price series with a coloured ribbon below showing regime probability."""
+    import matplotlib.pyplot as plt
+    if ax is None:
+        fig, ax = plt.subplots(2, 1, figsize=(13, 4),
+                               gridspec_kw={"height_ratios": [3, 1]},
+                               sharex=True)
+    ax[0].plot(prices, color=ACCENT, lw=0.6)
+    ax[0].set_ylabel("RRP ($/MWh)")
+    ax[0].set_title("TAS1 prices, with inferred regime probability below")
+    ax[1].fill_between(np.arange(len(regime_prob_high)),
+                       0, regime_prob_high, color=WARN, alpha=0.7)
+    ax[1].set_ylim(0, 1)
+    ax[1].set_ylabel("P(high-vol)")
+    ax[1].set_xlabel("trading interval index")
+    return ax
+
+
+def cvar_frontier(frontier, ax=None):
+    """Pareto plot of (mean revenue, CVaR_5%) across CVaR-SDP risk levels."""
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 5))
+    means = [r["mean"] for r in frontier]
+    cvars = [r["cvar5"] for r in frontier]
+    labels = [r["label"] for r in frontier]
+    ax.plot(cvars, means, "-o", color=ACCENT, lw=1.5, ms=7)
+    for c, m, l in zip(cvars, means, labels):
+        ax.annotate(l, (c, m), textcoords="offset points", xytext=(8, 4),
+                    fontsize=8)
+    ax.set_xlabel("CVaR @ 5% (worst-tail revenue $)")
+    ax.set_ylabel("expected revenue ($)")
+    return ax
+
+
+def drl_training_curve(reward_history, baseline_mean, ax=None):
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(11, 3.5))
+    h = np.array(reward_history)
+    # rolling mean of last 100 episodes
+    if len(h) >= 50:
+        rolling = np.convolve(h, np.ones(50) / 50, mode="valid")
+        ax.plot(np.arange(len(rolling)) + 49, rolling, color=ACCENT, lw=1.4,
+                label="50-episode rolling mean")
+    ax.scatter(np.arange(len(h)), h, color=ACCENT, alpha=0.18, s=6)
+    ax.axhline(baseline_mean, color=WARN, ls="--", lw=1.0,
+               label=f"greedy baseline mean: {baseline_mean:,.0f}")
+    ax.set_xlabel("episode")
+    ax.set_ylabel("episode return ($)")
+    ax.legend()
+    return ax
+
+
 def garch_residual_diagnostics(std_resid, axes=None):
     """Histogram + QQ of standardised residuals, side by side."""
     import matplotlib.pyplot as plt

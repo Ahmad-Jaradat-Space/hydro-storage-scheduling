@@ -6,4 +6,7 @@ seaborn>=0.13
 statsmodels>=0.14
 arch>=7.0
 nemosis>=3.7
+pywavelets>=1.5
+torch>=2.2
+numpyro>=0.13
 jupyter>=1.0
