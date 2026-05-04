@@ -47,6 +47,8 @@ class HydroEnv:
         a = float(np.clip(a_norm, 0.0, 1.0)) * self.reservoir.a_max
         a = min(a, max(0.0, self.V / 0.5))
         price = float(self.scenarios[self.path_idx, self.t])
+        if price < 0:                          # operator override
+            a = 0.0
         reward = price * 0.5 * a
         self.V, _ = self.reservoir.step(self.V, a, self.inflow[self.t])
         self.t += 1

@@ -61,6 +61,9 @@ def solve_cvar_sdp(reservoir, P_trans, price_centres, T, alpha=0.10,
     value[-1] = terminal_reward
     policy = np.zeros((T, n_V, n_p), dtype=np.int8)
 
+    # same action-feasibility mask as in solve_sdp
+    feasible_V_a = (a_grid[None, :] <= 2 * V_grid[:, None])    # (n_V, n_a)
+
     for t in range(T - 1, -1, -1):
         inflow = mean_inflow_per_t[t]
         V_after = V_grid[:, None] + inflow - 0.5 * a_grid[None, :]
@@ -108,8 +111,9 @@ def solve_cvar_sdp(reservoir, P_trans, price_centres, T, alpha=0.10,
             partial_v = np.take_along_axis(cl_sorted, first_above[..., None], axis=2)[..., 0]
             cvar = (full_mass + partial_mass * partial_v) / alpha   # (n_V, n_a)
 
-            # Q[V, a] = reward[p, a] + cvar[V, a]
+            # Q[V, a] = reward[p, a] + cvar[V, a]; mask infeasible actions
             Q = reward[p][None, :] + cvar
+            Q = np.where(feasible_V_a, Q, -np.inf)
             best = Q.argmax(axis=1)
             new_val[:, p] = np.take_along_axis(Q, best[:, None], axis=1)[:, 0]
             new_pol[:, p] = best.astype(np.int8)

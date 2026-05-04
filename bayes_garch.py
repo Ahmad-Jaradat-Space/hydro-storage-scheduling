@@ -89,4 +89,7 @@ def simulate_paths(samples, last_price, last_return, n_paths, horizon,
         out[:, t] = np.exp(log_p) - shift
         r_prev = r_t
         h_prev = h
-    return out
+    # AEMO market price floor / ceiling. The Bayesian GARCH on log-returns
+    # can drift outside these in long simulations; clipping reflects the
+    # actual market design.
+    return np.clip(out, -1000.0, 17500.0)
