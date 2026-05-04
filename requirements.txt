@@ -1,0 +1,9 @@
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+statsmodels>=0.14
+arch>=7.0
+nemosis>=3.7
+jupyter>=1.0
