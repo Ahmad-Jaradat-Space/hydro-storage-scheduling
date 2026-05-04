@@ -84,6 +84,74 @@ def scenarios_fan(scenarios, real=None, ax=None, n_show=200):
     return ax
 
 
+def garch_residual_diagnostics(std_resid, axes=None):
+    """Histogram + QQ of standardised residuals, side by side."""
+    import matplotlib.pyplot as plt
+    from scipy import stats
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+    axes[0].hist(std_resid, bins=80, density=True, alpha=0.7, color=ACCENT)
+    xs = np.linspace(-5, 5, 200)
+    axes[0].plot(xs, stats.norm.pdf(xs), color="black", lw=1.2, label="N(0,1)")
+    axes[0].set_xlabel("standardised residual")
+    axes[0].set_ylabel("density")
+    axes[0].set_title("Residuals vs N(0,1)")
+    axes[0].legend()
+    stats.probplot(std_resid, dist="norm", plot=axes[1])
+    axes[1].get_lines()[0].set_color(ACCENT)
+    axes[1].get_lines()[0].set_markersize(3)
+    axes[1].get_lines()[1].set_color(WARN)
+    axes[1].set_title("Normal QQ")
+    return axes
+
+
+def trajectory_overlay(price_path, all_traj, V_max, a_max, axes=None):
+    """Three-panel overlay for multiple policies on the same realised path."""
+    import matplotlib.pyplot as plt
+    if axes is None:
+        _, axes = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
+    palette = {"perfect-foresight LP": "#7e57c2",
+               "SDP": ACCENT,
+               "greedy threshold": GOOD}
+    T = len(price_path); ts = np.arange(T)
+    axes[0].plot(ts, price_path, color="black", lw=1.0)
+    axes[0].set_ylabel("price ($/MWh)")
+    axes[0].set_title("Realised TAS1 price (one out-of-sample day)")
+    for name, (Vh, ah, _) in all_traj.items():
+        col = palette.get(name, ACCENT)
+        axes[1].step(ts, ah, where="post", color=col, lw=1.0,
+                     alpha=0.85, label=name)
+        axes[2].plot(np.arange(len(Vh)), Vh, color=col, lw=1.0,
+                     alpha=0.85, label=name)
+    axes[1].set_ylim(-5, a_max + 5)
+    axes[1].set_ylabel("dispatch (MW)")
+    axes[1].legend(loc="upper left", fontsize=8)
+    axes[1].set_title("Dispatch — when each policy releases water")
+    axes[2].set_ylim(-50, V_max + 50)
+    axes[2].set_ylabel("reservoir (MWh)")
+    axes[2].set_xlabel("half-hour from horizon start")
+    axes[2].set_title("Reservoir level")
+    return axes
+
+
+def policy_heatmap_grid(policy, V_grid, t_list, titles, axes=None):
+    """Side-by-side policy heatmaps at several timesteps."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    n = len(t_list)
+    if axes is None:
+        _, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.5), sharey=True)
+    for ax, t, title in zip(axes, t_list, titles):
+        sns.heatmap(policy[t].astype(float), cmap="viridis",
+                    cbar=(t == t_list[-1]),
+                    cbar_kws={"label": "action index"} if t == t_list[-1] else None,
+                    xticklabels=False, yticklabels=False, ax=ax)
+        ax.set_xlabel("price decile (low → high)")
+        ax.set_title(title)
+    axes[0].set_ylabel("reservoir level (empty → full)")
+    return axes
+
+
 def policy_heatmap(policy, V_grid, edges, t=0, ax=None):
     """Heatmap of optimal action vs (reservoir level, price decile) at time t."""
     if ax is None:
