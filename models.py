@@ -163,6 +163,9 @@ def simulate_policy_sdp(reservoir, policy, V_grid, a_grid, P_edges,
         p_idx = int(np.clip(np.searchsorted(P_edges, price_path[t], side="right") - 1, 0, n_p - 1))
         a_idx = int(policy[t, v_idx, p_idx])
         a = a_grid[a_idx]
+        # cap action at the physically feasible amount: can't dispatch
+        # more energy than is currently in the reservoir
+        a = min(a, max(0.0, V / 0.5))
         rev[t] = price_path[t] * 0.5 * a
         V, _ = reservoir.step(V, a, inflow_path[t])
         Vh[t + 1] = V; ah[t] = a
